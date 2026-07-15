@@ -2,34 +2,57 @@
 streamlit_app.py
 =================
 
-Versão Streamlit do bot de SIMULAÇÃO "Coringa Cash" (conta DEMO da Deriv).
+Bot "Coringa Cash" para a Deriv — Streamlit.
 
-Como o Streamlit re-executa o script a cada interação e não lida bem com
-loops assíncronos infinitos bloqueando a thread principal, a estratégia
-roda numa THREAD separada em background. A interface só lê o estado
-(trades, saldo, win rate) desse background e se atualiza sozinha.
+*** ATUALIZAÇÃO IMPORTANTE (jul/2026) ***
+A Deriv trocou a forma de autenticar na API de Opções. O fluxo antigo
+(conectar direto no WebSocket e mandar {"authorize": token}) não
+funciona mais para essa API e devolve HTTP 401. O fluxo novo é:
+
+  1) REST: lista as contas do usuário
+        GET https://api.derivws.com/trading/v1/options/accounts
+  2) REST: pede um OTP (senha de uso único) para a conta escolhida
+        POST https://api.derivws.com/trading/v1/options/accounts/{account_id}/otp
+     A resposta já vem com a URL do WebSocket pronta, ex:
+        wss://api.derivws.com/trading/v1/options/ws/demo?otp=xxxxx   (conta demo)
+        wss://api.derivws.com/trading/v1/options/ws/real?otp=xxxxx   (conta real)
+  3) WebSocket: conecta direto nessa URL. NÃO precisa mais mandar
+     "authorize" — o otp na própria URL já autentica a sessão.
+
+Todas as chamadas REST precisam do header "Deriv-App-ID" e de um
+Bearer token — que pode ser:
+  - um Personal Access Token (PAT), colado manualmente; ou
+  - um access_token obtido via OAuth2 + PKCE ("Entrar com a Deriv").
+
+As mensagens de trading dentro do WebSocket (ticks, proposal, buy,
+proposal_open_contract, forget) continuam no mesmo formato de sempre.
+Se a Deriv mudar esse formato também, o app vai mostrar o erro cru no
+"Log de eventos" para facilitar o ajuste.
 
 USO:
   pip install -r requirements.txt
   streamlit run streamlit_app.py
 
-Depois, na sidebar, cole o token DEMO da Deriv e clique em "Iniciar".
-
-IMPORTANTE:
-  - Continua sendo só para conta DEMO. O script trava sozinho se detectar
-    um login que não pareça demo (VRTC/VRT).
-  - Nunca commit o token no GitHub. No Streamlit Community Cloud, use
-    "Secrets" (Settings > Secrets) para guardar o DERIV_TOKEN.
+IMPORTANTE — DINHEIRO REAL:
+  - O app agora suporta conta REAL além da DEMO. Ao escolher REAL,
+    é preciso marcar uma confirmação explícita antes de iniciar.
+  - Nunca faça commit de tokens no GitHub. No Streamlit Community
+    Cloud, use "Secrets" (Settings > Secrets) para guardar
+    DERIV_TOKEN, DERIV_APP_ID e DERIV_CLIENT_ID/SECRET se usar OAuth.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
+import secrets
 import threading
 import time
 from collections import deque
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 import websockets
 
@@ -52,9 +75,12 @@ DEFAULT_MAX_TRADES = 200
 DEFAULT_COOLDOWN_AFTER_WINS = 3
 DEFAULT_COOLDOWN_TICKS = 10
 
+REST_BASE_URL = "https://api.derivws.com"
+OAUTH_AUTHORIZE_URL = "https://auth.deriv.com/oauth2/auth"
+OAUTH_TOKEN_URL = "https://auth.deriv.com/oauth2/token"
+
 # ----------------------------------------------------------------------
 # ESTADO GLOBAL COMPARTILHADO ENTRE A THREAD DO BOT E O STREAMLIT
-# (usar um dict simples + lock evita problemas de concorrência)
 # ----------------------------------------------------------------------
 
 if "bot_state" not in st.session_state:
@@ -65,8 +91,8 @@ if "bot_state" not in st.session_state:
         "win_count": 0,
         "loss_count": 0,
         "total_pnl": 0.0,
-        "trades": [],   # lista de dicts, um por trade
-        "log": [],      # linhas de status/erro
+        "trades": [],
+        "log": [],
         "account": None,
         "error": None,
     }
@@ -78,7 +104,7 @@ state_lock = threading.Lock()
 def push_log(msg):
     with state_lock:
         state["log"].append(f"{datetime.now().strftime('%H:%M:%S')} - {msg}")
-        state["log"] = state["log"][-200:]  # mantém só as últimas 200 linhas
+        state["log"] = state["log"][-200:]
 
 
 def digit_distribution(window):
@@ -102,23 +128,117 @@ def should_enter(window, window_size, high_pct_threshold):
     return cond_1_to_8_high and cond_9_low
 
 
-async def authorize(ws, token):
-    await ws.send(json.dumps({"authorize": token}))
-    resp = json.loads(await ws.recv())
-    if "error" in resp:
-        raise RuntimeError(f"Falha ao autorizar: {resp['error']['message']}")
-    account = resp["authorize"]
-    is_demo = account["loginid"].startswith(("VRTC", "VRT"))
-    with state_lock:
-        state["account"] = account["loginid"]
-    if not is_demo:
-        raise RuntimeError(
-            f"Login '{account['loginid']}' não parece ser conta DEMO (VRTC/VRT). "
-            "Abortado por segurança."
-        )
-    push_log(f"Autenticado na conta demo: {account['loginid']}")
-    return account
+# ----------------------------------------------------------------------
+# NOVO: FLUXO REST (LISTA DE CONTAS + OTP) — substitui o "authorize" antigo
+# ----------------------------------------------------------------------
 
+class DerivRestError(Exception):
+    pass
+
+
+def rest_headers(app_id, bearer_token):
+    return {
+        "Deriv-App-ID": app_id,
+        "Authorization": f"Bearer {bearer_token}",
+    }
+
+
+def rest_list_accounts(app_id, bearer_token):
+    """GET /trading/v1/options/accounts -> lista de contas do usuário.
+
+    Cada conta tem (entre outros) account_id, account_type ("demo"/"real"),
+    currency, balance. Se o formato vier diferente do esperado, mostramos
+    o JSON cru no log para facilitar o ajuste.
+    """
+    url = f"{REST_BASE_URL}/trading/v1/options/accounts"
+    resp = requests.get(url, headers=rest_headers(app_id, bearer_token), timeout=15)
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise DerivRestError(f"Resposta não-JSON ao listar contas (HTTP {resp.status_code}): {resp.text[:300]}")
+
+    if resp.status_code >= 400:
+        err = payload.get("errors", [{}])[0] if isinstance(payload, dict) else {}
+        raise DerivRestError(
+            f"HTTP {resp.status_code} ao listar contas: {err.get('code', '?')} - "
+            f"{err.get('message', payload)}"
+        )
+
+    data = payload.get("data", payload)
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        raise DerivRestError(f"Formato inesperado na lista de contas: {payload}")
+    return data
+
+
+def rest_get_otp_ws_url(app_id, bearer_token, account_id):
+    """POST /trading/v1/options/accounts/{account_id}/otp -> URL de WS pronta."""
+    url = f"{REST_BASE_URL}/trading/v1/options/accounts/{account_id}/otp"
+    resp = requests.post(url, headers=rest_headers(app_id, bearer_token), timeout=15)
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise DerivRestError(f"Resposta não-JSON ao pedir OTP (HTTP {resp.status_code}): {resp.text[:300]}")
+
+    if resp.status_code >= 400:
+        err = payload.get("errors", [{}])[0] if isinstance(payload, dict) else {}
+        raise DerivRestError(
+            f"HTTP {resp.status_code} ao pedir OTP: {err.get('code', '?')} - "
+            f"{err.get('message', payload)}"
+        )
+
+    data = payload.get("data", payload)
+    ws_url = data.get("url") if isinstance(data, dict) else None
+    if not ws_url:
+        raise DerivRestError(f"Resposta do OTP não trouxe 'url': {payload}")
+    return ws_url
+
+
+# ----------------------------------------------------------------------
+# NOVO: LOGIN OAUTH2 + PKCE ("Entrar com a Deriv")
+# ----------------------------------------------------------------------
+
+def pkce_pair():
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def build_oauth_authorize_url(app_id, redirect_uri, state_token, code_challenge):
+    return (
+        f"{OAUTH_AUTHORIZE_URL}?response_type=code&client_id={app_id}"
+        f"&redirect_uri={redirect_uri}&scope=trade+account_manage"
+        f"&state={state_token}&code_challenge={code_challenge}&code_challenge_method=S256"
+    )
+
+
+def exchange_oauth_code(app_id, redirect_uri, code, code_verifier):
+    resp = requests.post(
+        OAUTH_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": app_id,
+            "code": code,
+            "code_verifier": code_verifier,
+            "redirect_uri": redirect_uri,
+        },
+        timeout=15,
+    )
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise DerivRestError(f"Resposta não-JSON ao trocar code por token: {resp.text[:300]}")
+    if resp.status_code >= 400 or "access_token" not in payload:
+        raise DerivRestError(f"Falha ao trocar code por token: {payload}")
+    return payload["access_token"]
+
+
+# ----------------------------------------------------------------------
+# WEBSOCKET DE TRADING (mesmo protocolo de mensagens de antes)
+# ----------------------------------------------------------------------
 
 async def buy_contract(ws, last_digit_dist, params):
     proposal_req = {
@@ -186,8 +306,7 @@ async def buy_contract(ws, last_digit_dist, params):
     return trade_row
 
 
-async def bot_loop(token, app_id, params):
-    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
+async def bot_loop(ws_url, account_label, params):
     digit_window = deque(maxlen=params["window_size"])
     consecutive_wins = 0
     cooldown_remaining = 0
@@ -195,10 +314,13 @@ async def bot_loop(token, app_id, params):
 
     try:
         async with websockets.connect(ws_url, ping_interval=20) as ws:
-            await authorize(ws, token)
+            with state_lock:
+                state["account"] = account_label
+            push_log(f"Conectado ({account_label}). Simulação/operação iniciada. "
+                     f"Stake={params['stake']} | Janela={params['window_size']} | "
+                     f"Meta={params['max_trades']} trades")
+
             await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-            push_log(f"Simulação iniciada. Stake={params['stake']} | "
-                     f"Janela={params['window_size']} | Meta={params['max_trades']} trades")
 
             while True:
                 with state_lock:
@@ -206,6 +328,11 @@ async def bot_loop(token, app_id, params):
                         break
 
                 msg = json.loads(await ws.recv())
+
+                if msg.get("error"):
+                    push_log(f"ERRO da API: {msg['error'].get('message')}")
+                    continue
+
                 if msg.get("msg_type") != "tick":
                     continue
 
@@ -253,12 +380,12 @@ async def bot_loop(token, app_id, params):
     finally:
         with state_lock:
             state["running"] = False
-        push_log("Simulação encerrada.")
+        push_log("Encerrado.")
 
 
-def start_bot_thread(token, app_id, params):
+def start_bot_thread(ws_url, account_label, params):
     def runner():
-        asyncio.run(bot_loop(token, app_id, params))
+        asyncio.run(bot_loop(ws_url, account_label, params))
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
@@ -268,18 +395,67 @@ def start_bot_thread(token, app_id, params):
 # INTERFACE STREAMLIT
 # ----------------------------------------------------------------------
 
-st.set_page_config(page_title="Coringa Cash - Simulação (Demo)", layout="wide")
-st.title("🃏 Coringa Cash — Simulação em conta DEMO")
+st.set_page_config(page_title="Coringa Cash - Deriv", layout="wide")
+st.title("🃏 Coringa Cash — Deriv (Demo/Real)")
 st.caption(
     "Ferramenta de teste/estudo: mede o EV real observado da regra de entrada "
-    "contra um RNG i.i.d. Não roda em conta real."
+    "contra um RNG i.i.d. Suporta conta DEMO e conta REAL."
 )
+
+# ---- captura de retorno do OAuth (?code=...&state=...) ----
+query_params = st.query_params
+if "oauth_flow" not in st.session_state:
+    st.session_state.oauth_flow = {"verifier": None, "state": None, "access_token": None}
 
 with st.sidebar:
     st.header("Configuração")
-    token = st.text_input("Token DEMO da Deriv", type="password",
-                           value=st.secrets.get("DERIV_TOKEN", "") if hasattr(st, "secrets") else "")
+
+    auth_method = st.radio("Autenticação", ["Token (PAT)", "Entrar com a Deriv (OAuth)"])
     app_id = st.text_input("App ID", value=DEFAULT_APP_ID)
+    account_choice = st.radio("Tipo de conta", ["Demo", "Real"], horizontal=True)
+
+    bearer_token = None
+
+    if auth_method == "Token (PAT)":
+        bearer_token = st.text_input(
+            "Personal Access Token (PAT) da Deriv", type="password",
+            value=st.secrets.get("DERIV_TOKEN", "") if hasattr(st, "secrets") else "",
+        )
+    else:
+        redirect_uri = st.text_input(
+            "Redirect URI (a URL deste app, cadastrada no painel da Deriv)",
+            value=st.secrets.get("DERIV_REDIRECT_URI", "") if hasattr(st, "secrets") else "",
+        )
+
+        if st.session_state.oauth_flow["access_token"]:
+            st.success("Login com a Deriv concluído.")
+            bearer_token = st.session_state.oauth_flow["access_token"]
+        elif "code" in query_params and "state" in query_params:
+            if query_params["state"] == st.session_state.oauth_flow.get("state"):
+                try:
+                    token = exchange_oauth_code(
+                        app_id, redirect_uri, query_params["code"],
+                        st.session_state.oauth_flow["verifier"],
+                    )
+                    st.session_state.oauth_flow["access_token"] = token
+                    bearer_token = token
+                    st.query_params.clear()
+                    st.success("Login com a Deriv concluído.")
+                except DerivRestError as e:
+                    st.error(f"Falha no login OAuth: {e}")
+            else:
+                st.error("State do OAuth não confere. Tente novamente.")
+        else:
+            if redirect_uri and st.button("🔑 Entrar com a Deriv"):
+                verifier, challenge = pkce_pair()
+                state_token = secrets.token_urlsafe(16)
+                st.session_state.oauth_flow["verifier"] = verifier
+                st.session_state.oauth_flow["state"] = state_token
+                auth_url = build_oauth_authorize_url(app_id, redirect_uri, state_token, challenge)
+                st.markdown(f"[Clique aqui para entrar com sua conta Deriv]({auth_url})")
+            elif not redirect_uri:
+                st.info("Preencha o Redirect URI (precisa estar cadastrado no painel de apps da Deriv) para habilitar o login.")
+
     stake = st.number_input("Stake", min_value=0.35, value=DEFAULT_STAKE, step=0.05)
     window_size = st.number_input("Janela (ticks)", min_value=5, value=DEFAULT_WINDOW_SIZE, step=1)
     high_pct_threshold = st.slider("Limiar % dígitos 1-8", 0.5, 1.0, DEFAULT_HIGH_PCT_THRESHOLD, 0.01)
@@ -288,13 +464,20 @@ with st.sidebar:
                                            min_value=1, value=DEFAULT_COOLDOWN_AFTER_WINS, step=1)
     cooldown_ticks = st.number_input("Ticks de pausa", min_value=1, value=DEFAULT_COOLDOWN_TICKS, step=1)
 
+    real_confirm = True
+    if account_choice == "Real":
+        st.warning("Conta REAL selecionada: as ordens usam dinheiro de verdade.")
+        real_confirm = st.checkbox("Confirmo que quero operar com dinheiro real (conta REAL)")
+
     col_a, col_b = st.columns(2)
     start_clicked = col_a.button("▶ Iniciar", disabled=state["running"])
     stop_clicked = col_b.button("⏹ Parar", disabled=not state["running"])
 
 if start_clicked:
-    if not token:
-        st.sidebar.error("Cola o token DEMO antes de iniciar.")
+    if not bearer_token:
+        st.sidebar.error("Autentique-se (token ou login com a Deriv) antes de iniciar.")
+    elif account_choice == "Real" and not real_confirm:
+        st.sidebar.error("Marque a confirmação de conta REAL antes de iniciar.")
     else:
         with state_lock:
             state.update({
@@ -308,12 +491,34 @@ if start_clicked:
                 "log": [],
                 "error": None,
             })
-        params = dict(
-            stake=stake, window_size=int(window_size),
-            high_pct_threshold=high_pct_threshold, max_trades=int(max_trades),
-            cooldown_after_wins=int(cooldown_after_wins), cooldown_ticks=int(cooldown_ticks),
-        )
-        start_bot_thread(token, app_id, params)
+        try:
+            accounts = rest_list_accounts(app_id, bearer_token)
+            wanted_type = "demo" if account_choice == "Demo" else "real"
+            match = next(
+                (a for a in accounts if str(a.get("account_type", "")).lower() == wanted_type),
+                None,
+            )
+            if match is None and len(accounts) == 1:
+                match = accounts[0]  # só uma conta disponível: usa ela mesmo
+            if match is None:
+                raise DerivRestError(
+                    f"Nenhuma conta do tipo '{wanted_type}' encontrada. Contas disponíveis: {accounts}"
+                )
+
+            account_id = match.get("account_id") or match.get("loginid") or match.get("id")
+            ws_url = rest_get_otp_ws_url(app_id, bearer_token, account_id)
+            params = dict(
+                stake=stake, window_size=int(window_size),
+                high_pct_threshold=high_pct_threshold, max_trades=int(max_trades),
+                cooldown_after_wins=int(cooldown_after_wins), cooldown_ticks=int(cooldown_ticks),
+            )
+            start_bot_thread(ws_url, f"{account_id} ({wanted_type})", params)
+        except DerivRestError as e:
+            with state_lock:
+                state["running"] = False
+                state["error"] = str(e)
+            push_log(f"ERRO ao preparar conexão: {e}")
+            st.sidebar.error(str(e))
 
 if stop_clicked:
     with state_lock:
