@@ -1,94 +1,87 @@
 """
-coringa_cash_bot.py
-====================
+streamlit_app.py
+=================
 
-Bot de SIMULAÇÃO (conta DEMO da Deriv) que implementa a estratégia
-"Coringa Cash" da Placa Curiosa:
+Versão Streamlit do bot de SIMULAÇÃO "Coringa Cash" (conta DEMO da Deriv).
 
-  - Contrato: DIGITUND (Digit Under), barreira = 9
-    -> Ganha se o último dígito do tick for 0-8 (qualquer coisa exceto 9)
-    -> Perde se o último dígito for exatamente 9
-
-  - Regra de entrada (conforme a placa):
-    Entra quando, numa janela dos últimos N ticks:
-      * o percentual combinado dos dígitos 1-8 estiver "alto"
-      * E o percentual do dígito 9 estiver em {0%, 1%, 4%, 8%}
-
-OBJETIVO: rodar isso numa conta DEMO, registrar CADA trade (ganho/perda,
-stake, payout) e no final calcular o EV real observado, comparando com
-o EV teórico. Isso serve para provar (ou refutar, com dados reais) se a
-regra de entrada tem algum poder preditivo sobre um RNG i.i.d.
-
-REQUISITOS:
-  pip install websockets --break-system-packages
+Como o Streamlit re-executa o script a cada interação e não lida bem com
+loops assíncronos infinitos bloqueando a thread principal, a estratégia
+roda numa THREAD separada em background. A interface só lê o estado
+(trades, saldo, win rate) desse background e se atualiza sozinha.
 
 USO:
-  1. Cria uma conta demo em https://deriv.com (é grátis)
-  2. Gera um token de API (Deriv > Configurações > API Token) com
-     escopo "Trade" habilitado para a conta DEMO (nunca uses token
-     de conta REAL para testes).
-  3. Preenche DERIV_TOKEN e (opcional) DERIV_APP_ID abaixo, ou passa
-     como variáveis de ambiente.
-  4. python3 coringa_cash_bot.py
+  pip install -r requirements.txt
+  streamlit run streamlit_app.py
+
+Depois, na sidebar, cole o token DEMO da Deriv e clique em "Iniciar".
 
 IMPORTANTE:
-  - Este script é só para fins de teste/estudo em conta DEMO.
-  - Não há garantia de lucro. A intenção declarada é MEDIR o EV real
-    da estratégia, não "vencer" o mercado.
+  - Continua sendo só para conta DEMO. O script trava sozinho se detectar
+    um login que não pareça demo (VRTC/VRT).
+  - Nunca commit o token no GitHub. No Streamlit Community Cloud, use
+    "Secrets" (Settings > Secrets) para guardar o DERIV_TOKEN.
 """
 
 import asyncio
-import csv
 import json
-import os
-import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime
 
+import pandas as pd
+import streamlit as st
 import websockets
 
 # ----------------------------------------------------------------------
-# CONFIGURAÇÃO
+# CONFIGURAÇÃO PADRÃO (ajustável na sidebar)
 # ----------------------------------------------------------------------
 
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")  # app_id público de teste da Deriv
-DERIV_TOKEN = os.environ.get("DERIV_TOKEN", "COLOQUE_AQUI_SEU_TOKEN_DEMO")
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DEFAULT_APP_ID = "1089"
+SYMBOL = "R_100"
+CONTRACT_TYPE = "DIGITUND"
+BARRIER = "9"
+DURATION = 1
 
-SYMBOL = "R_100"          # índice sintético (Volatility 100 Index)
-STAKE = 0.35              # valor da entrada, igual ao sugerido na placa
-DURATION = 1              # duração do contrato em ticks
-CONTRACT_TYPE = "DIGITUND"  # "Digit Under"
-BARRIER = "9"              # ganha se o dígito < 9 (ou seja, 0-8)
-
-WINDOW_SIZE = 25           # tamanho da janela de ticks para calcular percentuais
-HIGH_PCT_THRESHOLD = 0.75  # "percentual alto" dos dígitos 1-8 combinados (ajustável)
-NINE_LOW_PCTS = {0.00, 0.01, 0.04, 0.08}  # percentuais "baixos" aceitáveis p/ o dígito 9
-NINE_LOW_TOLERANCE = 0.015  # tolerância em torno dos valores acima (ticks discretos)
-
-MAX_TRADES = 200           # número de trades da simulação antes de parar e resumir
-COOLDOWN_AFTER_WINS = 3    # "pausa após ganhos consecutivos" (regra da placa)
-COOLDOWN_TICKS = 10        # quantos ticks pular após a pausa
-
-LOG_FILE = "coringa_cash_log.csv"
+DEFAULT_STAKE = 0.35
+DEFAULT_WINDOW_SIZE = 25
+DEFAULT_HIGH_PCT_THRESHOLD = 0.75
+NINE_LOW_PCTS = {0.00, 0.01, 0.04, 0.08}
+NINE_LOW_TOLERANCE = 0.015
+DEFAULT_MAX_TRADES = 200
+DEFAULT_COOLDOWN_AFTER_WINS = 3
+DEFAULT_COOLDOWN_TICKS = 10
 
 # ----------------------------------------------------------------------
-# ESTADO
+# ESTADO GLOBAL COMPARTILHADO ENTRE A THREAD DO BOT E O STREAMLIT
+# (usar um dict simples + lock evita problemas de concorrência)
 # ----------------------------------------------------------------------
 
-digit_window = deque(maxlen=WINDOW_SIZE)
-trade_count = 0
-win_count = 0
-loss_count = 0
-total_pnl = 0.0
-consecutive_wins = 0
-cooldown_remaining = 0
-trade_in_flight = False
+if "bot_state" not in st.session_state:
+    st.session_state.bot_state = {
+        "running": False,
+        "stop_requested": False,
+        "trade_count": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "total_pnl": 0.0,
+        "trades": [],   # lista de dicts, um por trade
+        "log": [],      # linhas de status/erro
+        "account": None,
+        "error": None,
+    }
+
+state = st.session_state.bot_state
+state_lock = threading.Lock()
+
+
+def push_log(msg):
+    with state_lock:
+        state["log"].append(f"{datetime.now().strftime('%H:%M:%S')} - {msg}")
+        state["log"] = state["log"][-200:]  # mantém só as últimas 200 linhas
 
 
 def digit_distribution(window):
-    """Retorna dict {digito: percentual} da janela atual."""
     if not window:
         return {}
     counts = {d: 0 for d in range(10)}
@@ -98,85 +91,39 @@ def digit_distribution(window):
     return {d: counts[d] / n for d in range(10)}
 
 
-def should_enter(window):
-    """Implementa a regra de entrada do Coringa Cash."""
-    if len(window) < WINDOW_SIZE:
+def should_enter(window, window_size, high_pct_threshold):
+    if len(window) < window_size:
         return False
     dist = digit_distribution(window)
     pct_1_to_8 = sum(dist[d] for d in range(1, 9))
     pct_9 = dist[9]
-
-    cond_1_to_8_high = pct_1_to_8 >= HIGH_PCT_THRESHOLD
+    cond_1_to_8_high = pct_1_to_8 >= high_pct_threshold
     cond_9_low = any(abs(pct_9 - target) <= NINE_LOW_TOLERANCE for target in NINE_LOW_PCTS)
-
     return cond_1_to_8_high and cond_9_low
 
 
-def log_trade(row):
-    file_exists = os.path.isfile(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "timestamp", "symbol", "stake", "contract_type", "barrier",
-                "resultado", "payout", "pnl", "saldo_acumulado",
-                "pct_1_a_8", "pct_9",
-            ])
-        writer.writerow(row)
-
-
-def print_summary():
-    print("\n" + "=" * 60)
-    print("RESUMO DA SIMULAÇÃO - CORINGA CASH (conta DEMO)")
-    print("=" * 60)
-    print(f"Total de trades:      {trade_count}")
-    print(f"Vitórias:             {win_count}")
-    print(f"Derrotas:             {loss_count}")
-    if trade_count > 0:
-        win_rate = win_count / trade_count * 100
-        print(f"Win rate observado:   {win_rate:.2f}%")
-    print(f"P&L total:            {total_pnl:.2f}")
-    if trade_count > 0:
-        ev_por_trade = total_pnl / trade_count
-        print(f"EV médio por trade:   {ev_por_trade:.4f}")
-    print(f"Log completo salvo em: {LOG_FILE}")
-    print("=" * 60)
-
-
-async def send_request(ws, request):
-    await ws.send(json.dumps(request))
-    while True:
-        response = json.loads(await ws.recv())
-        if response.get("msg_type") == request.get("_expect", response.get("msg_type")):
-            return response
-        # devolve a primeira resposta relevante; chamador filtra por msg_type
-        return response
-
-
-async def authorize(ws):
-    await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+async def authorize(ws, token):
+    await ws.send(json.dumps({"authorize": token}))
     resp = json.loads(await ws.recv())
     if "error" in resp:
         raise RuntimeError(f"Falha ao autorizar: {resp['error']['message']}")
     account = resp["authorize"]
-    print(f"Autenticado na conta: {account['loginid']} "
-          f"({'DEMO' if account['loginid'].startswith(('VRTC', 'VRT')) else 'REAL - CUIDADO'})")
-    if not account["loginid"].startswith(("VRTC", "VRT")):
-        print("!!! ATENÇÃO: este NÃO parece ser um login de conta demo (VRTC/VRT). "
-              "Abortando por segurança. Usa um token de conta demo. !!!")
-        sys.exit(1)
+    is_demo = account["loginid"].startswith(("VRTC", "VRT"))
+    with state_lock:
+        state["account"] = account["loginid"]
+    if not is_demo:
+        raise RuntimeError(
+            f"Login '{account['loginid']}' não parece ser conta DEMO (VRTC/VRT). "
+            "Abortado por segurança."
+        )
+    push_log(f"Autenticado na conta demo: {account['loginid']}")
     return account
 
 
-async def buy_contract(ws, last_digit_dist):
-    global trade_count, win_count, loss_count, total_pnl
-    global trade_in_flight, consecutive_wins, cooldown_remaining
-
-    trade_in_flight = True
-
+async def buy_contract(ws, last_digit_dist, params):
     proposal_req = {
         "proposal": 1,
-        "amount": STAKE,
+        "amount": params["stake"],
         "basis": "stake",
         "contract_type": CONTRACT_TYPE,
         "currency": "USD",
@@ -188,24 +135,20 @@ async def buy_contract(ws, last_digit_dist):
     await ws.send(json.dumps(proposal_req))
     proposal_resp = json.loads(await ws.recv())
     if "error" in proposal_resp:
-        print(f"Erro na proposta: {proposal_resp['error']['message']}")
-        trade_in_flight = False
-        return
+        push_log(f"Erro na proposta: {proposal_resp['error']['message']}")
+        return None
 
     proposal_id = proposal_resp["proposal"]["id"]
     ask_price = proposal_resp["proposal"]["ask_price"]
 
-    buy_req = {"buy": proposal_id, "price": ask_price}
-    await ws.send(json.dumps(buy_req))
+    await ws.send(json.dumps({"buy": proposal_id, "price": ask_price}))
     buy_resp = json.loads(await ws.recv())
     if "error" in buy_resp:
-        print(f"Erro na compra: {buy_resp['error']['message']}")
-        trade_in_flight = False
-        return
+        push_log(f"Erro na compra: {buy_resp['error']['message']}")
+        return None
 
     contract_id = buy_resp["buy"]["contract_id"]
 
-    # Subscreve ao contrato até ele fechar
     await ws.send(json.dumps({
         "proposal_open_contract": 1,
         "contract_id": contract_id,
@@ -223,89 +166,190 @@ async def buy_contract(ws, last_digit_dist):
         contract = msg["proposal_open_contract"]
         if contract.get("is_sold"):
             payout = contract.get("payout", 0.0)
-            buy_price = contract.get("buy_price", STAKE)
+            buy_price = contract.get("buy_price", params["stake"])
             pnl = payout - buy_price
             result_label = "GANHO" if pnl > 0 else "PERDA"
-            # cancela a subscrição
             await ws.send(json.dumps({"forget": msg["subscription"]["id"]}))
             break
-
-    trade_count += 1
-    total_pnl += pnl
-    if result_label == "GANHO":
-        win_count += 1
-        consecutive_wins += 1
-    else:
-        loss_count += 1
-        consecutive_wins = 0
-
-    if consecutive_wins >= COOLDOWN_AFTER_WINS:
-        cooldown_remaining = COOLDOWN_TICKS
-        consecutive_wins = 0
-        print(f"  -> {COOLDOWN_AFTER_WINS} ganhos seguidos: pausa de {COOLDOWN_TICKS} ticks (regra da placa).")
 
     pct_1_8 = sum(last_digit_dist.get(d, 0) for d in range(1, 9))
     pct_9 = last_digit_dist.get(9, 0)
 
-    log_trade([
-        datetime.utcnow().isoformat(), SYMBOL, STAKE, CONTRACT_TYPE, BARRIER,
-        result_label, f"{payout:.2f}", f"{pnl:.2f}", f"{total_pnl:.2f}",
-        f"{pct_1_8:.2%}", f"{pct_9:.2%}",
-    ])
+    trade_row = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "resultado": result_label,
+        "payout": round(payout, 2),
+        "pnl": round(pnl, 2),
+        "pct_1_a_8": f"{pct_1_8:.1%}",
+        "pct_9": f"{pct_9:.1%}",
+    }
+    return trade_row
 
-    print(f"[{trade_count:4d}] {result_label:6s}  pnl={pnl:+.2f}  "
-          f"saldo_acumulado={total_pnl:+.2f}  win_rate={win_count/trade_count:.1%}")
 
+async def bot_loop(token, app_id, params):
+    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
+    digit_window = deque(maxlen=params["window_size"])
+    consecutive_wins = 0
+    cooldown_remaining = 0
     trade_in_flight = False
 
-
-async def run_bot():
-    global cooldown_remaining
-
-    if DERIV_TOKEN == "COLOQUE_AQUI_SEU_TOKEN_DEMO":
-        print("!!! Configura DERIV_TOKEN (variável de ambiente ou no topo do script) "
-              "com um token de conta DEMO antes de rodar. !!!")
-        return
-
-    async with websockets.connect(DERIV_WS_URL, ping_interval=20) as ws:
-        await authorize(ws)
-
-        await ws.send(json.dumps({
-            "ticks": SYMBOL,
-            "subscribe": 1,
-        }))
-
-        print(f"Simulação iniciada. Estratégia=Coringa Cash | Símbolo={SYMBOL} | "
-              f"Stake={STAKE} | Janela={WINDOW_SIZE} ticks | Meta={MAX_TRADES} trades\n")
-
-        while trade_count < MAX_TRADES:
-            msg = json.loads(await ws.recv())
-            if msg.get("msg_type") != "tick":
-                continue
-
-            quote = msg["tick"]["quote"]
-            last_digit = int(str(quote).replace(".", "")[-1])
-            digit_window.append(last_digit)
-
-            if cooldown_remaining > 0:
-                cooldown_remaining -= 1
-                continue
-
-            if trade_in_flight:
-                continue
-
-            if should_enter(digit_window):
-                dist_snapshot = digit_distribution(digit_window)
-                await buy_contract(ws, dist_snapshot)
-
-        # cancela subscrição de ticks
-        await ws.send(json.dumps({"forget_all": "ticks"}))
-
-    print_summary()
-
-
-if __name__ == "__main__":
     try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        print_summary()
+        async with websockets.connect(ws_url, ping_interval=20) as ws:
+            await authorize(ws, token)
+            await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+            push_log(f"Simulação iniciada. Stake={params['stake']} | "
+                     f"Janela={params['window_size']} | Meta={params['max_trades']} trades")
+
+            while True:
+                with state_lock:
+                    if state["stop_requested"] or state["trade_count"] >= params["max_trades"]:
+                        break
+
+                msg = json.loads(await ws.recv())
+                if msg.get("msg_type") != "tick":
+                    continue
+
+                quote = msg["tick"]["quote"]
+                last_digit = int(str(quote).replace(".", "")[-1])
+                digit_window.append(last_digit)
+
+                if cooldown_remaining > 0:
+                    cooldown_remaining -= 1
+                    continue
+
+                if trade_in_flight:
+                    continue
+
+                if should_enter(digit_window, params["window_size"], params["high_pct_threshold"]):
+                    trade_in_flight = True
+                    dist_snapshot = digit_distribution(digit_window)
+                    trade_row = await buy_contract(ws, dist_snapshot, params)
+                    trade_in_flight = False
+
+                    if trade_row is not None:
+                        with state_lock:
+                            state["trade_count"] += 1
+                            state["total_pnl"] += trade_row["pnl"]
+                            if trade_row["resultado"] == "GANHO":
+                                state["win_count"] += 1
+                                consecutive_wins += 1
+                            else:
+                                state["loss_count"] += 1
+                                consecutive_wins = 0
+                            state["trades"].append(trade_row)
+
+                        if consecutive_wins >= params["cooldown_after_wins"]:
+                            cooldown_remaining = params["cooldown_ticks"]
+                            consecutive_wins = 0
+                            push_log(f"{params['cooldown_after_wins']} ganhos seguidos: "
+                                     f"pausa de {params['cooldown_ticks']} ticks.")
+
+            await ws.send(json.dumps({"forget_all": "ticks"}))
+
+    except Exception as e:
+        with state_lock:
+            state["error"] = str(e)
+        push_log(f"ERRO: {e}")
+    finally:
+        with state_lock:
+            state["running"] = False
+        push_log("Simulação encerrada.")
+
+
+def start_bot_thread(token, app_id, params):
+    def runner():
+        asyncio.run(bot_loop(token, app_id, params))
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+
+
+# ----------------------------------------------------------------------
+# INTERFACE STREAMLIT
+# ----------------------------------------------------------------------
+
+st.set_page_config(page_title="Coringa Cash - Simulação (Demo)", layout="wide")
+st.title("🃏 Coringa Cash — Simulação em conta DEMO")
+st.caption(
+    "Ferramenta de teste/estudo: mede o EV real observado da regra de entrada "
+    "contra um RNG i.i.d. Não roda em conta real."
+)
+
+with st.sidebar:
+    st.header("Configuração")
+    token = st.text_input("Token DEMO da Deriv", type="password",
+                           value=st.secrets.get("DERIV_TOKEN", "") if hasattr(st, "secrets") else "")
+    app_id = st.text_input("App ID", value=DEFAULT_APP_ID)
+    stake = st.number_input("Stake", min_value=0.35, value=DEFAULT_STAKE, step=0.05)
+    window_size = st.number_input("Janela (ticks)", min_value=5, value=DEFAULT_WINDOW_SIZE, step=1)
+    high_pct_threshold = st.slider("Limiar % dígitos 1-8", 0.5, 1.0, DEFAULT_HIGH_PCT_THRESHOLD, 0.01)
+    max_trades = st.number_input("Máximo de trades", min_value=1, value=DEFAULT_MAX_TRADES, step=10)
+    cooldown_after_wins = st.number_input("Pausa após N vitórias seguidas",
+                                           min_value=1, value=DEFAULT_COOLDOWN_AFTER_WINS, step=1)
+    cooldown_ticks = st.number_input("Ticks de pausa", min_value=1, value=DEFAULT_COOLDOWN_TICKS, step=1)
+
+    col_a, col_b = st.columns(2)
+    start_clicked = col_a.button("▶ Iniciar", disabled=state["running"])
+    stop_clicked = col_b.button("⏹ Parar", disabled=not state["running"])
+
+if start_clicked:
+    if not token:
+        st.sidebar.error("Cola o token DEMO antes de iniciar.")
+    else:
+        with state_lock:
+            state.update({
+                "running": True,
+                "stop_requested": False,
+                "trade_count": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "total_pnl": 0.0,
+                "trades": [],
+                "log": [],
+                "error": None,
+            })
+        params = dict(
+            stake=stake, window_size=int(window_size),
+            high_pct_threshold=high_pct_threshold, max_trades=int(max_trades),
+            cooldown_after_wins=int(cooldown_after_wins), cooldown_ticks=int(cooldown_ticks),
+        )
+        start_bot_thread(token, app_id, params)
+
+if stop_clicked:
+    with state_lock:
+        state["stop_requested"] = True
+
+# ---- painel de status ----
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Trades", state["trade_count"])
+col2.metric("Vitórias", state["win_count"])
+col3.metric("Derrotas", state["loss_count"])
+win_rate = (state["win_count"] / state["trade_count"] * 100) if state["trade_count"] else 0
+col4.metric("Win rate", f"{win_rate:.1f}%")
+
+st.metric("P&L acumulado", f"{state['total_pnl']:+.2f}")
+
+if state["account"]:
+    st.success(f"Conta: {state['account']}")
+if state["error"]:
+    st.error(state["error"])
+
+st.subheader("Trades")
+if state["trades"]:
+    df_trades = pd.DataFrame(list(reversed(state["trades"])))
+    st.dataframe(df_trades, use_container_width=True, height=300)
+    st.download_button(
+        "⬇ Baixar CSV desta sessão",
+        data=df_trades.to_csv(index=False).encode("utf-8"),
+        file_name=f"coringa_cash_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+    )
+else:
+    st.info("Nenhum trade registrado ainda.")
+
+with st.expander("Log de eventos"):
+    st.code("\n".join(reversed(state["log"])) or "—")
+
+if state["running"]:
+    time.sleep(2)
+    st.rerun()
