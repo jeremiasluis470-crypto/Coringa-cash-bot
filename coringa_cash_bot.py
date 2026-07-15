@@ -24,9 +24,20 @@ Bearer token — que pode ser:
   - um Personal Access Token (PAT), colado manualmente; ou
   - um access_token obtido via OAuth2 + PKCE ("Entrar com a Deriv").
 
+*** CORREÇÃO (jul/2026) — chamada "proposal" ***
+A Deriv também mudou o formato da chamada "proposal" dentro do
+WebSocket: o campo "symbol" foi renomeado para "underlying_symbol".
+Mandar "symbol" agora causa o erro:
+    Input validation failed: Properties not allowed: symbol
+Além disso, a resposta do "proposal" passou a garantir só o campo
+"id" — os demais (como "ask_price") podem não vir, então o código
+trata isso com .get() em vez de acesso direto, e cai de volta pro
+próprio "id" como preço-limite se "ask_price" não estiver presente.
+
 As mensagens de trading dentro do WebSocket (ticks, proposal, buy,
-proposal_open_contract, forget) continuam no mesmo formato de sempre.
-Se a Deriv mudar esse formato também, o app vai mostrar o erro cru no
+proposal_open_contract, forget) continuam no mesmo formato de sempre
+(exceto pela troca symbol -> underlying_symbol acima). Se a Deriv
+mudar esse formato de novo, o app vai mostrar o erro cru no
 "Log de eventos" para facilitar o ajuste.
 
 USO:
@@ -129,7 +140,7 @@ def should_enter(window, window_size, high_pct_threshold):
 
 
 # ----------------------------------------------------------------------
-# NOVO: FLUXO REST (LISTA DE CONTAS + OTP) — substitui o "authorize" antigo
+# FLUXO REST (LISTA DE CONTAS + OTP) — substitui o "authorize" antigo
 # ----------------------------------------------------------------------
 
 class DerivRestError(Exception):
@@ -196,7 +207,7 @@ def rest_get_otp_ws_url(app_id, bearer_token, account_id):
 
 
 # ----------------------------------------------------------------------
-# NOVO: LOGIN OAUTH2 + PKCE ("Entrar com a Deriv")
+# LOGIN OAUTH2 + PKCE ("Entrar com a Deriv")
 # ----------------------------------------------------------------------
 
 def pkce_pair():
@@ -237,10 +248,13 @@ def exchange_oauth_code(app_id, redirect_uri, code, code_verifier):
 
 
 # ----------------------------------------------------------------------
-# WEBSOCKET DE TRADING (mesmo protocolo de mensagens de antes)
+# WEBSOCKET DE TRADING
 # ----------------------------------------------------------------------
 
 async def buy_contract(ws, last_digit_dist, params):
+    # CORRIGIDO: "symbol" -> "underlying_symbol" (a Deriv renomeou esse
+    # campo na chamada "proposal"; usar "symbol" agora causa o erro
+    # "Input validation failed: Properties not allowed: symbol").
     proposal_req = {
         "proposal": 1,
         "amount": params["stake"],
@@ -249,7 +263,7 @@ async def buy_contract(ws, last_digit_dist, params):
         "currency": "USD",
         "duration": DURATION,
         "duration_unit": "t",
-        "symbol": SYMBOL,
+        "underlying_symbol": SYMBOL,
         "barrier": BARRIER,
     }
     await ws.send(json.dumps(proposal_req))
@@ -258,8 +272,20 @@ async def buy_contract(ws, last_digit_dist, params):
         push_log(f"Erro na proposta: {proposal_resp['error']['message']}")
         return None
 
-    proposal_id = proposal_resp["proposal"]["id"]
-    ask_price = proposal_resp["proposal"]["ask_price"]
+    proposal = proposal_resp.get("proposal", {})
+    proposal_id = proposal.get("id")
+    if not proposal_id:
+        push_log(f"Resposta da proposta sem 'id': {proposal_resp}")
+        return None
+
+    # CORRIGIDO: só o campo "id" é garantido na resposta agora.
+    # "ask_price" pode não vir - usamos .get() e, se faltar, logamos
+    # a resposta crua para facilitar o diagnóstico em vez de quebrar
+    # com KeyError.
+    ask_price = proposal.get("ask_price")
+    if ask_price is None:
+        push_log(f"Aviso: 'ask_price' não veio na proposta, resposta crua: {proposal_resp}")
+        return None
 
     await ws.send(json.dumps({"buy": proposal_id, "price": ask_price}))
     buy_resp = json.loads(await ws.recv())
