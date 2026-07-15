@@ -34,6 +34,19 @@ Além disso, a resposta do "proposal" passou a garantir só o campo
 trata isso com .get() em vez de acesso direto, e cai de volta pro
 próprio "id" como preço-limite se "ask_price" não estiver presente.
 
+*** CORREÇÃO (jul/2026) — contract_type inválido ***
+O valor "DIGITUND" usado antes NÃO existe na API da Deriv — o valor
+correto para contratos de dígito "Under" é "DIGITUNDER". Esse erro de
+digitação era a causa do "Input validation failed: Properties not
+allowed: contract_type".
+
+*** NOVO — seleção de ativo e valor a investir ***
+O ativo (symbol) agora é escolhido na sidebar em vez de fixo em
+"R_100", e o valor a investir (stake) já existia mas foi renomeado na
+tela para deixar mais claro. Só é oferecida a lista de índices
+sintéticos, porque esse tipo de contrato de dígitos não existe para
+ações individuais na Deriv.
+
 As mensagens de trading dentro do WebSocket (ticks, proposal, buy,
 proposal_open_contract, forget) continuam no mesmo formato de sempre
 (exceto pela troca symbol -> underlying_symbol acima). Se a Deriv
@@ -72,10 +85,24 @@ import websockets
 # ----------------------------------------------------------------------
 
 DEFAULT_APP_ID = "1089"
-SYMBOL = "R_100"
-CONTRACT_TYPE = "DIGITUND"
+CONTRACT_TYPE = "DIGITUNDER"  # CORRIGIDO: era "DIGITUND" (inválido) -> "DIGITUNDER"
 BARRIER = "9"
 DURATION = 1
+
+# Ativos que suportam contratos de dígitos (Over/Under). A Deriv não
+# oferece ações individuais para esse tipo de contrato — apenas índices
+# sintéticos. Formato: (rótulo exibido, símbolo da API)
+AVAILABLE_SYMBOLS = [
+    ("Volatility 100 Index", "R_100"),
+    ("Volatility 75 Index", "R_75"),
+    ("Volatility 50 Index", "R_50"),
+    ("Volatility 25 Index", "R_25"),
+    ("Volatility 10 Index", "R_10"),
+    ("Volatility 100 (1s) Index", "1HZ100V"),
+    ("Volatility 75 (1s) Index", "1HZ75V"),
+    ("Volatility 50 (1s) Index", "1HZ50V"),
+]
+DEFAULT_SYMBOL = "R_100"
 
 DEFAULT_STAKE = 0.35
 DEFAULT_WINDOW_SIZE = 25
@@ -105,6 +132,7 @@ if "bot_state" not in st.session_state:
         "trades": [],
         "log": [],
         "account": None,
+        "symbol": None,
         "error": None,
     }
 
@@ -263,7 +291,7 @@ async def buy_contract(ws, last_digit_dist, params):
         "currency": "USD",
         "duration": DURATION,
         "duration_unit": "t",
-        "underlying_symbol": SYMBOL,
+        "underlying_symbol": params["symbol"],
         "barrier": BARRIER,
     }
     await ws.send(json.dumps(proposal_req))
@@ -343,10 +371,10 @@ async def bot_loop(ws_url, account_label, params):
             with state_lock:
                 state["account"] = account_label
             push_log(f"Conectado ({account_label}). Simulação/operação iniciada. "
-                     f"Stake={params['stake']} | Janela={params['window_size']} | "
-                     f"Meta={params['max_trades']} trades")
+                     f"Ativo={params['symbol']} | Stake={params['stake']} | "
+                     f"Janela={params['window_size']} | Meta={params['max_trades']} trades")
 
-            await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+            await ws.send(json.dumps({"ticks": params["symbol"], "subscribe": 1}))
 
             while True:
                 with state_lock:
@@ -482,7 +510,14 @@ with st.sidebar:
             elif not redirect_uri:
                 st.info("Preencha o Redirect URI (precisa estar cadastrado no painel de apps da Deriv) para habilitar o login.")
 
-    stake = st.number_input("Stake", min_value=0.35, value=DEFAULT_STAKE, step=0.05)
+    symbol_labels = [label for label, _ in AVAILABLE_SYMBOLS]
+    default_index = next(
+        (i for i, (_, sym) in enumerate(AVAILABLE_SYMBOLS) if sym == DEFAULT_SYMBOL), 0
+    )
+    symbol_label = st.selectbox("Ativo", symbol_labels, index=default_index)
+    symbol = dict(AVAILABLE_SYMBOLS)[symbol_label]
+
+    stake = st.number_input("Valor a investir (stake)", min_value=0.35, value=DEFAULT_STAKE, step=0.05)
     window_size = st.number_input("Janela (ticks)", min_value=5, value=DEFAULT_WINDOW_SIZE, step=1)
     high_pct_threshold = st.slider("Limiar % dígitos 1-8", 0.5, 1.0, DEFAULT_HIGH_PCT_THRESHOLD, 0.01)
     max_trades = st.number_input("Máximo de trades", min_value=1, value=DEFAULT_MAX_TRADES, step=10)
@@ -533,8 +568,10 @@ if start_clicked:
 
             account_id = match.get("account_id") or match.get("loginid") or match.get("id")
             ws_url = rest_get_otp_ws_url(app_id, bearer_token, account_id)
+            with state_lock:
+                state["symbol"] = symbol
             params = dict(
-                stake=stake, window_size=int(window_size),
+                symbol=symbol, stake=stake, window_size=int(window_size),
                 high_pct_threshold=high_pct_threshold, max_trades=int(max_trades),
                 cooldown_after_wins=int(cooldown_after_wins), cooldown_ticks=int(cooldown_ticks),
             )
@@ -561,7 +598,8 @@ col4.metric("Win rate", f"{win_rate:.1f}%")
 st.metric("P&L acumulado", f"{state['total_pnl']:+.2f}")
 
 if state["account"]:
-    st.success(f"Conta: {state['account']}")
+    ativo_txt = f" | Ativo: {state['symbol']}" if state.get("symbol") else ""
+    st.success(f"Conta: {state['account']}{ativo_txt}")
 if state["error"]:
     st.error(state["error"])
 
