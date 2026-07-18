@@ -40,6 +40,18 @@ correto para contratos de dígito "Under" é "DIGITUNDER". Esse erro de
 digitação era a causa do "Input validation failed: Properties not
 allowed: contract_type".
 
+*** CORREÇÃO (jul/2026) — campos numéricos vindo como string ***
+Na mesma atualização, vários campos numéricos da resposta (ask_price,
+payout, buy_price, etc.) passaram a poder vir como STRING em vez de
+número ("type: number | string" no schema oficial da Deriv). Isso
+quebrava o cálculo do resultado do trade com:
+
+    TypeError: unsupported operand type(s) for -: 'str' and 'str'
+
+porque o código fazia `payout - buy_price` assumindo que os dois já
+eram float. A correção é converter TODO valor numérico vindo da API
+com a função utilitária `to_float()` antes de qualquer conta.
+
 *** NOVO — seleção de ativo e valor a investir ***
 O ativo (symbol) agora é escolhido na sidebar em vez de fixo em
 "R_100", e o valor a investir (stake) já existia mas foi renomeado na
@@ -116,6 +128,30 @@ DEFAULT_COOLDOWN_TICKS = 10
 REST_BASE_URL = "https://api.derivws.com"
 OAUTH_AUTHORIZE_URL = "https://auth.deriv.com/oauth2/auth"
 OAUTH_TOKEN_URL = "https://auth.deriv.com/oauth2/token"
+
+# ----------------------------------------------------------------------
+# UTILITÁRIO — CORREÇÃO DO BUG "str - str"
+# ----------------------------------------------------------------------
+
+
+def to_float(value, default=0.0):
+    """Converte com segurança um valor vindo da API (pode ser str, número
+    ou None) para float.
+
+    A Deriv passou a permitir 'number | string' em vários campos
+    numéricos da API de Opções (ex: ask_price, payout, buy_price) na
+    atualização de jul/2026. Sem essa conversão explícita, contas como
+    `payout - buy_price` quebram com:
+        TypeError: unsupported operand type(s) for -: 'str' and 'str'
+    sempre que a API decidir devolver esses campos como texto.
+    """
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 
 # ----------------------------------------------------------------------
 # ESTADO GLOBAL COMPARTILHADO ENTRE A THREAD DO BOT E O STREAMLIT
@@ -307,12 +343,15 @@ async def buy_contract(ws, last_digit_dist, params):
         return None
 
     # CORRIGIDO: só o campo "id" é garantido na resposta agora.
-    # "ask_price" pode não vir - usamos .get() e, se faltar, logamos
-    # a resposta crua para facilitar o diagnóstico em vez de quebrar
-    # com KeyError.
-    ask_price = proposal.get("ask_price")
-    if ask_price is None:
+    # "ask_price" pode não vir, e quando vem pode ser string ou número
+    # ("type: number | string" no schema novo) -> usamos to_float().
+    ask_price_raw = proposal.get("ask_price")
+    if ask_price_raw is None:
         push_log(f"Aviso: 'ask_price' não veio na proposta, resposta crua: {proposal_resp}")
+        return None
+    ask_price = to_float(ask_price_raw, default=None)
+    if ask_price is None:
+        push_log(f"Aviso: 'ask_price' veio num formato inválido: {ask_price_raw!r}")
         return None
 
     await ws.send(json.dumps({"buy": proposal_id, "price": ask_price}))
@@ -339,8 +378,12 @@ async def buy_contract(ws, last_digit_dist, params):
             continue
         contract = msg["proposal_open_contract"]
         if contract.get("is_sold"):
-            payout = contract.get("payout", 0.0)
-            buy_price = contract.get("buy_price", params["stake"])
+            # CORRIGIDO (bug reportado): payout e buy_price podem vir como
+            # string ("10.50") em vez de número. Sem to_float() aqui,
+            # `payout - buy_price` quebra com:
+            #   TypeError: unsupported operand type(s) for -: 'str' and 'str'
+            payout = to_float(contract.get("payout"), default=0.0)
+            buy_price = to_float(contract.get("buy_price"), default=params["stake"])
             pnl = payout - buy_price
             result_label = "GANHO" if pnl > 0 else "PERDA"
             await ws.send(json.dumps({"forget": msg["subscription"]["id"]}))
