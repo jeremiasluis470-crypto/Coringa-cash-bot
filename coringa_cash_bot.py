@@ -315,7 +315,7 @@ def exchange_oauth_code(app_id, redirect_uri, code, code_verifier):
 # WEBSOCKET DE TRADING
 # ----------------------------------------------------------------------
 
-async def buy_contract(ws, last_digit_dist, params):
+async def buy_contract(ws, last_digit_dist, params, digit_window=None):
     # CORRIGIDO: "symbol" -> "underlying_symbol" (a Deriv renomeou esse
     # campo na chamada "proposal"; usar "symbol" agora causa o erro
     # "Input validation failed: Properties not allowed: symbol").
@@ -371,29 +371,58 @@ async def buy_contract(ws, last_digit_dist, params):
     payout = 0.0
     pnl = 0.0
     result_label = "PENDENTE"
+    subscription_id = None
 
+    # CORRIGIDO (bug de vitórias "fantasma"): o loop antigo aceitava a
+    # PRIMEIRA mensagem proposal_open_contract com is_sold=true que chegasse,
+    # sem checar se ela pertencia a ESTE contract_id. Quando os trades
+    # disparam rápido (tick a tick), o "forget" do trade anterior às vezes
+    # ainda não tinha sido processado pela Deriv, e uma mensagem presa na
+    # fila de um contrato ANTERIOR (já vencedor) era capturada pelo trade
+    # novo — por isso o log só mostrava vitórias, mesmo quando o extrato
+    # real da Deriv tinha derrotas. Agora filtramos explicitamente por
+    # contract_id antes de aceitar o resultado como sendo deste trade.
     while True:
         msg = json.loads(await ws.recv())
         if msg.get("msg_type") != "proposal_open_contract":
             continue
         contract = msg["proposal_open_contract"]
+        if contract.get("contract_id") != contract_id:
+            continue  # mensagem de um contrato diferente (residual/atrasada) - ignora
         if contract.get("is_sold"):
-            # CORRIGIDO (bug reportado): payout e buy_price podem vir como
-            # string ("10.50") em vez de número. Sem to_float() aqui,
-            # `payout - buy_price` quebra com:
-            #   TypeError: unsupported operand type(s) for -: 'str' and 'str'
+            # payout e buy_price podem vir como string ("10.50") em vez de
+            # número -> to_float() evita o TypeError da subtração.
             payout = to_float(contract.get("payout"), default=0.0)
             buy_price = to_float(contract.get("buy_price"), default=params["stake"])
             pnl = payout - buy_price
             result_label = "GANHO" if pnl > 0 else "PERDA"
-            await ws.send(json.dumps({"forget": msg["subscription"]["id"]}))
+            subscription_id = msg.get("subscription", {}).get("id")
             break
+
+    # Manda o forget e ESPERA a confirmação antes de liberar o próximo
+    # trade, pra garantir que essa subscrição pare de fato de enviar
+    # mensagens e não vaze pro loop do próximo contrato.
+    if subscription_id:
+        await ws.send(json.dumps({"forget": subscription_id}))
+        try:
+            for _ in range(5):
+                ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
+                if ack.get("msg_type") == "forget":
+                    break
+                # não descarta ticks de mercado que chegarem nessa espera -
+                # continuam alimentando a janela usada pela regra de entrada
+                if ack.get("msg_type") == "tick" and digit_window is not None:
+                    quote = ack["tick"]["quote"]
+                    digit_window.append(int(str(quote).replace(".", "")[-1]))
+        except asyncio.TimeoutError:
+            push_log(f"Aviso: não recebi confirmação de 'forget' para contrato {contract_id} a tempo.")
 
     pct_1_8 = sum(last_digit_dist.get(d, 0) for d in range(1, 9))
     pct_9 = last_digit_dist.get(9, 0)
 
     trade_row = {
         "timestamp": datetime.utcnow().isoformat(),
+        "contract_id": contract_id,
         "resultado": result_label,
         "payout": round(payout, 2),
         "pnl": round(pnl, 2),
@@ -447,7 +476,7 @@ async def bot_loop(ws_url, account_label, params):
                 if should_enter(digit_window, params["window_size"], params["high_pct_threshold"]):
                     trade_in_flight = True
                     dist_snapshot = digit_distribution(digit_window)
-                    trade_row = await buy_contract(ws, dist_snapshot, params)
+                    trade_row = await buy_contract(ws, dist_snapshot, params, digit_window=digit_window)
                     trade_in_flight = False
 
                     if trade_row is not None:
