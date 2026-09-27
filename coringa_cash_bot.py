@@ -59,6 +59,22 @@ tela para deixar mais claro. Só é oferecida a lista de índices
 sintéticos, porque esse tipo de contrato de dígitos não existe para
 ações individuais na Deriv.
 
+*** NOVO (set/2026) — saldo real da conta ***
+O app agora subscreve o saldo da conta ("balance", subscribe=1) assim
+que conecta ao WebSocket, e mostra o saldo real (não apenas o P&L
+acumulado da sessão) no painel de status. Isso resolve o problema de
+a interface não mostrar quanto realmente existe na conta.
+
+*** NOVO (set/2026) — reconciliação com o extrato real da Deriv ***
+Ao terminar a sessão (parar o bot ou atingir o máximo de trades), o
+app busca o extrato real de contratos da conta via REST
+(/trading/v1/options/accounts/{account_id}/statement) e compara,
+contrato a contrato, com o que o bot registou localmente. Qualquer
+contrato que o extrato real mostra mas o bot não registou (ou com
+resultado/pnl diferente) aparece destacado na secção "Reconciliação"
+— isso existe porque já houve casos em que a interface só mostrava
+vitórias enquanto a conta real na Deriv also tinha derrotas.
+
 As mensagens de trading dentro do WebSocket (ticks, proposal, buy,
 proposal_open_contract, forget) continuam no mesmo formato de sempre
 (exceto pela troca symbol -> underlying_symbol acima). Se a Deriv
@@ -168,8 +184,12 @@ if "bot_state" not in st.session_state:
         "trades": [],
         "log": [],
         "account": None,
+        "account_id": None,
         "symbol": None,
         "error": None,
+        "balance": None,
+        "currency": None,
+        "reconciliation": None,
     }
 
 state = st.session_state.bot_state
@@ -268,6 +288,100 @@ def rest_get_otp_ws_url(app_id, bearer_token, account_id):
     if not ws_url:
         raise DerivRestError(f"Resposta do OTP não trouxe 'url': {payload}")
     return ws_url
+
+
+def rest_get_statement(app_id, bearer_token, account_id, limit=200):
+    """GET /trading/v1/options/accounts/{account_id}/statement -> extrato real.
+
+    Usado só no FIM da sessão para reconciliação: busca os últimos
+    contratos realmente registados na conta (segundo a própria Deriv,
+    não segundo o que o bot viu pelo WebSocket) e devolve uma lista de
+    dicts com pelo menos contract_id, profit/pnl e resultado. Se o
+    endpoint devolver um formato diferente do esperado, isso é
+    reportado no log em vez de travar a app.
+    """
+    url = f"{REST_BASE_URL}/trading/v1/options/accounts/{account_id}/statement"
+    resp = requests.get(
+        url, headers=rest_headers(app_id, bearer_token),
+        params={"limit": limit}, timeout=15,
+    )
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise DerivRestError(f"Resposta não-JSON ao buscar extrato (HTTP {resp.status_code}): {resp.text[:300]}")
+
+    if resp.status_code >= 400:
+        err = payload.get("errors", [{}])[0] if isinstance(payload, dict) else {}
+        raise DerivRestError(
+            f"HTTP {resp.status_code} ao buscar extrato: {err.get('code', '?')} - "
+            f"{err.get('message', payload)}"
+        )
+
+    data = payload.get("data", payload)
+    if isinstance(data, dict):
+        data = data.get("transactions") or data.get("items") or [data]
+    if not isinstance(data, list):
+        raise DerivRestError(f"Formato inesperado no extrato: {payload}")
+    return data
+
+
+def reconcile_trades(local_trades, real_statement):
+    """Compara os trades registados localmente pelo bot com o extrato
+    real da Deriv (rest_get_statement) e devolve um relatório de
+    divergências.
+
+    Isto existe especificamente porque já houve sessões em que a
+    interface só mostrava vitórias enquanto a conta real tinha
+    derrotas — ou seja, o registo local pode estar incompleto/errado
+    mesmo depois da correção do bug de contract_id.
+    """
+    local_by_id = {str(t["contract_id"]): t for t in local_trades}
+
+    real_by_id = {}
+    for tx in real_statement:
+        cid = tx.get("contract_id") or tx.get("id")
+        if cid is None:
+            continue
+        real_by_id[str(cid)] = tx
+
+    missing_locally = []   # a Deriv tem, o bot não registou
+    mismatched = []        # os dois têm, mas pnl/resultado não bate
+    real_total_pnl = 0.0
+
+    for cid, tx in real_by_id.items():
+        real_pnl = to_float(tx.get("profit", tx.get("pnl")), default=0.0)
+        real_total_pnl += real_pnl
+        real_result = "GANHO" if real_pnl > 0 else ("PERDA" if real_pnl < 0 else "NEUTRO")
+
+        local = local_by_id.get(cid)
+        if local is None:
+            missing_locally.append({
+                "contract_id": cid,
+                "resultado_real": real_result,
+                "pnl_real": round(real_pnl, 2),
+            })
+        else:
+            local_pnl = to_float(local.get("pnl"), default=0.0)
+            if abs(local_pnl - real_pnl) > 0.01 or local.get("resultado") != real_result:
+                mismatched.append({
+                    "contract_id": cid,
+                    "resultado_local": local.get("resultado"),
+                    "pnl_local": local_pnl,
+                    "resultado_real": real_result,
+                    "pnl_real": round(real_pnl, 2),
+                })
+
+    local_total_pnl = sum(to_float(t.get("pnl"), default=0.0) for t in local_trades)
+
+    return {
+        "n_local": len(local_trades),
+        "n_real": len(real_by_id),
+        "local_total_pnl": round(local_total_pnl, 2),
+        "real_total_pnl": round(real_total_pnl, 2),
+        "missing_locally": missing_locally,
+        "mismatched": mismatched,
+        "ok": not missing_locally and not mismatched,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -382,8 +496,18 @@ async def buy_contract(ws, last_digit_dist, params, digit_window=None):
     # novo — por isso o log só mostrava vitórias, mesmo quando o extrato
     # real da Deriv tinha derrotas. Agora filtramos explicitamente por
     # contract_id antes de aceitar o resultado como sendo deste trade.
+    #
+    # NOTA (set/2026): esse filtro reduz muito o problema mas não prova
+    # sozinho que o registo local bate 100% com a Deriv — por isso a
+    # reconciliação no fim da sessão (reconcile_trades) existe como
+    # segunda camada de verificação, contra o extrato real da conta.
     while True:
         msg = json.loads(await ws.recv())
+        if msg.get("msg_type") == "balance":
+            with state_lock:
+                state["balance"] = to_float(msg["balance"].get("balance"), default=state.get("balance"))
+                state["currency"] = msg["balance"].get("currency", state.get("currency"))
+            continue
         if msg.get("msg_type") != "proposal_open_contract":
             continue
         contract = msg["proposal_open_contract"]
@@ -414,6 +538,10 @@ async def buy_contract(ws, last_digit_dist, params, digit_window=None):
                 if ack.get("msg_type") == "tick" and digit_window is not None:
                     quote = ack["tick"]["quote"]
                     digit_window.append(int(str(quote).replace(".", "")[-1]))
+                if ack.get("msg_type") == "balance":
+                    with state_lock:
+                        state["balance"] = to_float(ack["balance"].get("balance"), default=state.get("balance"))
+                        state["currency"] = ack["balance"].get("currency", state.get("currency"))
         except asyncio.TimeoutError:
             push_log(f"Aviso: não recebi confirmação de 'forget' para contrato {contract_id} a tempo.")
 
@@ -432,7 +560,7 @@ async def buy_contract(ws, last_digit_dist, params, digit_window=None):
     return trade_row
 
 
-async def bot_loop(ws_url, account_label, params):
+async def bot_loop(ws_url, account_label, account_id, params, app_id, bearer_token):
     digit_window = deque(maxlen=params["window_size"])
     consecutive_wins = 0
     cooldown_remaining = 0
@@ -442,10 +570,15 @@ async def bot_loop(ws_url, account_label, params):
         async with websockets.connect(ws_url, ping_interval=20) as ws:
             with state_lock:
                 state["account"] = account_label
+                state["account_id"] = account_id
             push_log(f"Conectado ({account_label}). Simulação/operação iniciada. "
                      f"Ativo={params['symbol']} | Stake={params['stake']} | "
                      f"Janela={params['window_size']} | Meta={params['max_trades']} trades")
 
+            # NOVO: subscreve o saldo real da conta assim que conecta, para
+            # a interface deixar de mostrar só o P&L da sessão e passar a
+            # mostrar quanto existe de facto na conta.
+            await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
             await ws.send(json.dumps({"ticks": params["symbol"], "subscribe": 1}))
 
             while True:
@@ -457,6 +590,12 @@ async def bot_loop(ws_url, account_label, params):
 
                 if msg.get("error"):
                     push_log(f"ERRO da API: {msg['error'].get('message')}")
+                    continue
+
+                if msg.get("msg_type") == "balance":
+                    with state_lock:
+                        state["balance"] = to_float(msg["balance"].get("balance"), default=state.get("balance"))
+                        state["currency"] = msg["balance"].get("currency", state.get("currency"))
                     continue
 
                 if msg.get("msg_type") != "tick":
@@ -498,20 +637,47 @@ async def bot_loop(ws_url, account_label, params):
                                      f"pausa de {params['cooldown_ticks']} ticks.")
 
             await ws.send(json.dumps({"forget_all": "ticks"}))
+            await ws.send(json.dumps({"forget_all": "balance"}))
 
     except Exception as e:
         with state_lock:
             state["error"] = str(e)
         push_log(f"ERRO: {e}")
     finally:
+        # NOVO: reconciliação contra o extrato real da Deriv ao terminar a
+        # sessão (por stop manual, max_trades ou erro). Isto é o que
+        # confirma se o que a interface mostrou bate com o que a Deriv
+        # realmente registou.
+        try:
+            with state_lock:
+                local_trades = list(state["trades"])
+            if account_id and local_trades:
+                statement = rest_get_statement(app_id, bearer_token, account_id, limit=max(200, len(local_trades) * 2))
+                report = reconcile_trades(local_trades, statement)
+                with state_lock:
+                    state["reconciliation"] = report
+                if report["ok"]:
+                    push_log("Reconciliação com a Deriv: OK, tudo bate.")
+                else:
+                    push_log(
+                        f"Reconciliação com a Deriv: DIVERGÊNCIA — "
+                        f"{len(report['missing_locally'])} contrato(s) não registados localmente, "
+                        f"{len(report['mismatched'])} com resultado diferente. "
+                        f"P&L local={report['local_total_pnl']} vs P&L real={report['real_total_pnl']}."
+                    )
+        except DerivRestError as e:
+            push_log(f"Aviso: não foi possível reconciliar com o extrato real: {e}")
+        except Exception as e:
+            push_log(f"Aviso: erro inesperado na reconciliação: {e}")
+
         with state_lock:
             state["running"] = False
         push_log("Encerrado.")
 
 
-def start_bot_thread(ws_url, account_label, params):
+def start_bot_thread(ws_url, account_label, account_id, params, app_id, bearer_token):
     def runner():
-        asyncio.run(bot_loop(ws_url, account_label, params))
+        asyncio.run(bot_loop(ws_url, account_label, account_id, params, app_id, bearer_token))
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
@@ -623,6 +789,9 @@ if start_clicked:
                 "trades": [],
                 "log": [],
                 "error": None,
+                "balance": None,
+                "currency": None,
+                "reconciliation": None,
             })
         try:
             accounts = rest_list_accounts(app_id, bearer_token)
@@ -647,7 +816,7 @@ if start_clicked:
                 high_pct_threshold=high_pct_threshold, max_trades=int(max_trades),
                 cooldown_after_wins=int(cooldown_after_wins), cooldown_ticks=int(cooldown_ticks),
             )
-            start_bot_thread(ws_url, f"{account_id} ({wanted_type})", params)
+            start_bot_thread(ws_url, f"{account_id} ({wanted_type})", account_id, params, app_id, bearer_token)
         except DerivRestError as e:
             with state_lock:
                 state["running"] = False
@@ -660,20 +829,43 @@ if stop_clicked:
         state["stop_requested"] = True
 
 # ---- painel de status ----
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Trades", state["trade_count"])
 col2.metric("Vitórias", state["win_count"])
 col3.metric("Derrotas", state["loss_count"])
 win_rate = (state["win_count"] / state["trade_count"] * 100) if state["trade_count"] else 0
 col4.metric("Win rate", f"{win_rate:.1f}%")
+saldo_txt = f"{state['balance']:.2f} {state['currency']}" if state.get("balance") is not None else "—"
+col5.metric("Saldo da conta", saldo_txt)
 
-st.metric("P&L acumulado", f"{state['total_pnl']:+.2f}")
+st.metric("P&L acumulado (sessão)", f"{state['total_pnl']:+.2f}")
 
 if state["account"]:
     ativo_txt = f" | Ativo: {state['symbol']}" if state.get("symbol") else ""
     st.success(f"Conta: {state['account']}{ativo_txt}")
 if state["error"]:
     st.error(state["error"])
+
+# ---- reconciliação com o extrato real da Deriv ----
+recon = state.get("reconciliation")
+if recon is not None:
+    st.subheader("Reconciliação com a Deriv")
+    if recon["ok"]:
+        st.success(
+            f"Bate certo: {recon['n_local']} trade(s) locais = {recon['n_real']} no extrato real. "
+            f"P&L local {recon['local_total_pnl']:+.2f} = P&L real {recon['real_total_pnl']:+.2f}."
+        )
+    else:
+        st.error(
+            f"Divergência entre o app e o extrato real da Deriv! "
+            f"P&L local {recon['local_total_pnl']:+.2f} vs P&L real {recon['real_total_pnl']:+.2f}."
+        )
+        if recon["missing_locally"]:
+            st.write("Contratos que a Deriv registou e o app NÃO mostrou:")
+            st.dataframe(pd.DataFrame(recon["missing_locally"]), use_container_width=True)
+        if recon["mismatched"]:
+            st.write("Contratos com resultado diferente entre o app e a Deriv:")
+            st.dataframe(pd.DataFrame(recon["mismatched"]), use_container_width=True)
 
 st.subheader("Trades")
 if state["trades"]:
