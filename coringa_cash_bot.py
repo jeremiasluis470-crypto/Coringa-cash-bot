@@ -474,7 +474,23 @@ async def buy_contract(ws, last_digit_dist, params, digit_window=None):
         push_log(f"Erro na compra: {buy_resp['error']['message']}")
         return None
 
-    contract_id = buy_resp["buy"]["contract_id"]
+    # CORRIGIDO (set/2026) — crash "KeyError: 'buy'": a resposta da compra
+    # às vezes não vem no formato {"buy": {...}} nem {"error": {...}} —
+    # por exemplo pode vir vazia, atrasada, ou com outro msg_type
+    # intercalado. Aceder direto a buy_resp["buy"]["contract_id"] nesse
+    # caso derrubava a sessão INTEIRA sem nunca registar o trade, mesmo
+    # que a Deriv já tivesse debitado o saldo pela compra. Agora
+    # validamos a estrutura e, se vier diferente do esperado, registamos
+    # a resposta crua no log e devolvemos None em vez de rebentar.
+    buy_block = buy_resp.get("buy")
+    if not isinstance(buy_block, dict) or "contract_id" not in buy_block:
+        push_log(
+            f"Aviso: resposta de 'buy' num formato inesperado (pode já ter "
+            f"debitado saldo — confira o extrato real): {buy_resp}"
+        )
+        return None
+
+    contract_id = buy_block["contract_id"]
 
     await ws.send(json.dumps({
         "proposal_open_contract": 1,
@@ -615,7 +631,17 @@ async def bot_loop(ws_url, account_label, account_id, params, app_id, bearer_tok
                 if should_enter(digit_window, params["window_size"], params["high_pct_threshold"]):
                     trade_in_flight = True
                     dist_snapshot = digit_distribution(digit_window)
-                    trade_row = await buy_contract(ws, dist_snapshot, params, digit_window=digit_window)
+                    # CORRIGIDO (set/2026): um erro dentro de buy_contract
+                    # (ex.: resposta inesperada da API, timeout, KeyError)
+                    # derrubava a sessão INTEIRA — o saldo já podia ter sido
+                    # debitado pela Deriv, mas a sessão morria sem registar
+                    # nada e sem continuar a operar. Agora um erro num único
+                    # trade fica só no log e a sessão continua.
+                    try:
+                        trade_row = await buy_contract(ws, dist_snapshot, params, digit_window=digit_window)
+                    except Exception as e:
+                        push_log(f"ERRO ao processar trade (sessão continua): {e}")
+                        trade_row = None
                     trade_in_flight = False
 
                     if trade_row is not None:
